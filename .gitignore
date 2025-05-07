@@ -1,0 +1,4 @@
+# npm stuff
+node_modules/
+
+.env

@@ -63,6 +63,13 @@ project/
 ## Usage
 
 1. Ensure your backend server (e.g., your API) is running at `REMOTE_HTTP_SERVER`.
+    for example run the following in your kernel notebook
+    ```bash
+    !pip install vllm -q
+    !python3 -m vllm.entrypoints.openai.api_server \
+    --model facebook/opt-125m
+    ```
+    which will host an OpenAI Compatible http server on the remote machine.
 2. Start the proxy:
 
    ```bash

@@ -73,7 +73,7 @@ project/
 2. Start the proxy:
 
    ```bash
-   node server.js
+   npm start server
    ```
 3. Send HTTP requests to:
 

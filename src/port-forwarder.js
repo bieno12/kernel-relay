@@ -1,124 +1,181 @@
-// port-forwarder.js
 const net = require('net');
 const { v4: uuidv4 } = require('uuid');
+const readline = require('readline');
 const {
   getKernelSpecs,
   startNewKernel,
   connectToKernelWebSocket,
   executeCode,
-  setupPortForwarderInKernel, // <-- Using the new setup function
+  setupPortForwarderInKernel,
+  shutdownKernel,
 } = require('./kernelManager');
+require('dotenv').config();
+// --- Helper function for command-line prompts ---
+function promptForVar(question, defaultValue) {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
 
-const JUPYTER_PROXY_URL = process.env.JUPYTER_PROXY_URL || '';
-const LOCAL_PORT = process.env.LOCAL_PORT || 9000;
+  return new Promise(resolve => {
+    rl.question(`${question} [${defaultValue}]: `, answer => {
+      rl.close();
+      resolve(answer || defaultValue);
+    });
+  });
+}
 
-// This will map a connection ID to the local TCP socket
+// --- Declare key variables in a higher scope for access in the shutdown handler ---
+let ws = null;
+let kernel = null;
+let server = null;
+let JUPYTER_PROXY_URL = process.env.JUPYTER_PROXY_URL;
 const clientSockets = new Map();
+
 
 (async () => {
   try {
-    // 1. Connect to the Jupyter Kernel
+    // --- 1. Prompt for missing configuration ---
+    console.log('--- Port Forwarder Configuration ---');
+    if (!JUPYTER_PROXY_URL) {
+      JUPYTER_PROXY_URL = await promptForVar('Enter Jupyter Proxy URL', 'http://127.0.0.1:8888');
+    }
+    console.log(process.env.LOCAL_PORT)
+    const LOCAL_PORT = process.env.LOCAL_PORT || await promptForVar('Enter Local Port to listen on', '9000');
+    const REMOTE_HOST = process.env.REMOTE_HOST || await promptForVar('Enter Remote Host to connect to (from the kernel)', '127.0.0.1');
+    const REMOTE_PORT = process.env.REMOTE_PORT || await promptForVar('Enter Remote Port to connect to', '8000');
+    console.log('------------------------------------');
+
+
+    // --- 2. Connect to the Jupyter Kernel ---
     console.log('Connecting to Jupyter Kernel...');
     const specs = await getKernelSpecs(JUPYTER_PROXY_URL);
-    const kernel = await startNewKernel(JUPYTER_PROXY_URL, specs.default);
-    const ws = await connectToKernelWebSocket(JUPYTER_PROXY_URL, kernel.id);
+    kernel = await startNewKernel(JUPYTER_PROXY_URL, specs.default);
+    ws = await connectToKernelWebSocket(JUPYTER_PROXY_URL, kernel.id);
     console.log(`Connected to Kernel ID: ${kernel.id}`);
 
-    // 2. Inject the Python port forwarding logic into the kernel
-    await setupPortForwarderInKernel(ws);
 
-    // 3. Listen for messages coming BACK from the kernel
+    // --- 3. Inject the Python port forwarding logic into the kernel ---
+    await setupPortForwarderInKernel(ws, REMOTE_HOST, REMOTE_PORT);
+
+
+    // --- 4. Listen for messages coming BACK from the kernel ---
     ws.on('message', raw => {
+      // ... (This section is unchanged)
       const msg = JSON.parse(raw.toString());
-
-      // Log any errors from the kernel
       if (msg.msg_type === 'error') {
         console.error('--- KERNEL ERROR ---');
         console.error('Name:', msg.content.ename);
         console.error('Value:', msg.content.evalue);
         console.error('Traceback:\n' + msg.content.traceback.join('\n'));
         console.error('--------------------');
-        return; // Don't process further
+        return;
       }
-      
-      // Log any stderr output from the Python script for debugging
       if (msg.msg_type === 'stream' && msg.content.name === 'stderr') {
         console.log(`[KERNEL STDERR]: ${msg.content.text.trim()}`);
         return;
       }
-      
-      // This is our main data channel from Python
       if (msg.msg_type === 'stream' && msg.content.text.startsWith('FORWARDER_MSG:')) {
         const payload = JSON.parse(msg.content.text.slice('FORWARDER_MSG:'.length));
         const { type, conn_id, data, error } = payload;
         const localSocket = clientSockets.get(conn_id);
-
-        if (!localSocket) {
-            // This can happen if the local socket was already closed
-            return; 
-        }
-
+        if (!localSocket) { return; }
         switch (type) {
           case 'data':
-            // Data came from the remote service, write it to the local client
-            const buffer = Buffer.from(data, 'base64');
-            localSocket.write(buffer);
+            localSocket.write(Buffer.from(data, 'base64'));
             break;
           case 'close':
-            // The remote service closed the connection, so close our local one.
             console.log(`Connection ${conn_id} closed by remote. Closing local socket.`);
             localSocket.end();
             clientSockets.delete(conn_id);
             break;
           case 'connect_error':
-            // The Python script failed to connect to the target service
             console.error(`Kernel failed to connect for ${conn_id}: ${error}`);
-            localSocket.end(); // Close the client connection
+            localSocket.end();
             clientSockets.delete(conn_id);
             break;
         }
       }
     });
 
-    // 4. Create the local TCP server
-    const server = net.createServer(localSocket => {
+
+    // --- 5. Create the local TCP server ---
+    server = net.createServer(localSocket => {
+      // ... (This section is unchanged)
       const conn_id = uuidv4();
       console.log(`New local client connected. Assigning ID: ${conn_id}`);
       clientSockets.set(conn_id, localSocket);
-
-      // Tell the kernel to open a corresponding connection to the remote service
       executeCode(ws, `start_connection("${conn_id}")`);
-
-      // Handle data coming FROM the local client
       localSocket.on('data', chunk => {
-        // Base64 encode the data and tell the kernel to forward it
         const b64_data = chunk.toString('base64');
         const code = `forward_data("${conn_id}", "${b64_data}")`;
         executeCode(ws, code);
       });
-
-      // Handle the local client disconnecting
       localSocket.on('close', () => {
         console.log(`Local client ${conn_id} disconnected.`);
-        clientSockets.delete(conn_id);
-        // Tell the kernel to close its side of the connection
-        executeCode(ws, `close_connection("${conn_id}")`);
+        if (clientSockets.has(conn_id)) {
+            clientSockets.delete(conn_id);
+            executeCode(ws, `close_connection("${conn_id}")`);
+        }
       });
-
       localSocket.on('error', (err) => {
         console.error(`Error on local socket ${conn_id}:`, err);
-        clientSockets.delete(conn_id);
-        executeCode(ws, `close_connection("${conn_id}")`);
+        if (clientSockets.has(conn_id)) {
+            clientSockets.delete(conn_id);
+            executeCode(ws, `close_connection("${conn_id}")`);
+        }
       });
     });
 
     server.listen(LOCAL_PORT, () => {
-      console.log(`TCP Port Forwarder running.`);
-      console.log(`Forwarding connections from localhost:${LOCAL_PORT} -> (via kernel) -> ${process.env.REMOTE_HOST}:${process.env.REMOTE_PORT}`);
+      console.log(`\n✅ TCP Port Forwarder is running.`);
+      console.log(`   Forwarding connections from localhost:${LOCAL_PORT} -> (via kernel) -> ${REMOTE_HOST}:${REMOTE_PORT}`);
+      console.log(`   Press CTRL+C to shut down gracefully.\n`);
     });
 
   } catch (e) {
-    console.error("Fatal initialization error:", e);
+    console.error("\n❌ Fatal initialization error:", e.message);
+    // If the error happened after the kernel was created, try to clean it up.
+    if (kernel) {
+      await shutdownKernel(JUPYTER_PROXY_URL, kernel.id);
+    }
     process.exit(1);
   }
 })();
+
+// --- 6. Handle graceful shutdown on CTRL+C ---
+process.on('SIGINT', async () => {
+  console.log('\n\nCaught interrupt signal. Shutting down gracefully...');
+
+  // 1. Stop accepting new connections
+  if (server) {
+    server.close(() => {
+      console.log('Local server closed.');
+    });
+  }
+
+  // 2. Close all active connections on the kernel side
+  if (ws && clientSockets.size > 0) {
+    console.log(`Closing ${clientSockets.size} active connection(s) in kernel...`);
+    for (const conn_id of clientSockets.keys()) {
+      executeCode(ws, `close_connection("${conn_id}")`);
+    }
+  }
+
+  // 3. Destroy all local sockets
+  for (const socket of clientSockets.values()) {
+    socket.destroy();
+  }
+  clientSockets.clear();
+
+  // 4. Shut down the remote kernel itself
+  if (kernel) {
+    await shutdownKernel(JUPYTER_PROXY_URL, kernel.id);
+  }
+
+  // Give a moment for cleanup messages to be processed
+  setTimeout(() => {
+    console.log('Cleanup complete. Exiting.');
+    process.exit(0);
+  }, 1000);
+});

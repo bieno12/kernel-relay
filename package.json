@@ -7,6 +7,9 @@
     "server": "node src/port-forwarder.js",
     "shell": "node scripts/kaggle_shell.js"
   },
+  "bin": {
+    "kernel-relay": "scripts/cli.js"
+  },
   "author": "",
   "license": "ISC",
   "dependencies": {

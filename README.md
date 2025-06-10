@@ -31,6 +31,16 @@ A TCP port forwarding  that leverages the Jupyter kernel protocol to tunnel HTTP
    REMOTE_PORT=8000
    LOCAL_PORT=8000
    ```
+ ## Global kernel-relay
+ - optionally you can run
+ ```bash
+ npm link
+ ```
+ - so you can run ```kernel-relay``` anywhere
+ - for example
+ ```bash
+ kernel-relay --proxy-url <url> --local-port 9000 --remote-host 127.0.0.1 --remote-port 8000
+ ```
 
 ## Configuration
 

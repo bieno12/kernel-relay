@@ -61,42 +61,67 @@ const clientSockets = new Map();
 
     // --- 4. Listen for messages coming BACK from the kernel ---
     ws.on('message', raw => {
-      // ... (This section is unchanged)
-      const msg = JSON.parse(raw.toString());
-      if (msg.msg_type === 'error') {
+      const outer = JSON.parse(raw.toString());
+
+      // Handle our port-forwarder prints (may contain several JSON objects concatenated)
+      if (
+        outer.msg_type === 'stream' &&
+        outer.content?.name === 'stdout' &&
+        outer.content.text.includes('FORWARDER_MSG:')
+      ) {
+        const segments = outer.content.text
+          .split('\n')                       // each Python `print` ends with \n
+          .filter(Boolean)                   // drop empty lines
+          .filter(l => l.startsWith('FORWARDER_MSG:'));
+
+        for (const line of segments) {
+          try {
+            const payload = JSON.parse(
+              line.slice('FORWARDER_MSG:'.length)  // strip prefix
+            );
+            handleForwarder(payload);
+          } catch (e) {
+            console.error('Bad JSON from kernel:', e, line);
+          }
+        }
+        return;                               // nothing more to do for this outer msg
+      }
+
+      if (outer.msg_type === 'error') {
         console.error('--- KERNEL ERROR ---');
-        console.error('Name:', msg.content.ename);
-        console.error('Value:', msg.content.evalue);
-        console.error('Traceback:\n' + msg.content.traceback.join('\n'));
+        console.error('Name:', outer.content.ename);
+        console.error('Value:', outer.content.evalue);
+        console.error('Traceback:\n' + outer.content.traceback.join('\n'));
         console.error('--------------------');
         return;
       }
-      if (msg.msg_type === 'stream' && msg.content.name === 'stderr') {
-        console.log(`[KERNEL STDERR]: ${msg.content.text.trim()}`);
+
+      if (outer.msg_type === 'stream' && outer.content.name === 'stderr') {
+        console.log(`[KERNEL STDERR]: ${outer.content.text.trim()}`);
         return;
       }
-      if (msg.msg_type === 'stream' && msg.content.text.startsWith('FORWARDER_MSG:')) {
-        const payload = JSON.parse(msg.content.text.slice('FORWARDER_MSG:'.length));
-        const { type, conn_id, data, error } = payload;
-        const localSocket = clientSockets.get(conn_id);
-        if (!localSocket) { return; }
-        switch (type) {
-          case 'data':
-            localSocket.write(Buffer.from(data, 'base64'));
-            break;
-          case 'close':
-            console.log(`Connection ${conn_id} closed by remote. Closing local socket.`);
-            localSocket.end();
-            clientSockets.delete(conn_id);
-            break;
-          case 'connect_error':
-            console.error(`Kernel failed to connect for ${conn_id}: ${error}`);
-            localSocket.end();
-            clientSockets.delete(conn_id);
-            break;
-        }
-      }
     });
+    // --- Helper to process each decoded port-forwarder payload ---
+    function handleForwarder({ type, conn_id, data, error }) {
+      const localSocket = clientSockets.get(conn_id);
+      if (!localSocket) return;
+
+      switch (type) {
+        case 'data':
+          localSocket.write(Buffer.from(data, 'base64'));
+          break;
+        case 'close':
+          console.log(`Connection ${conn_id} closed by remote. Closing local socket.`);
+          localSocket.end();
+          clientSockets.delete(conn_id);
+          break;
+        case 'connect_error':
+          console.error(`Kernel failed to connect for ${conn_id}: ${error}`);
+          localSocket.end();
+          clientSockets.delete(conn_id);
+          break;
+      }
+    }
 
 
     // --- 5. Create the local TCP server ---
@@ -114,15 +139,15 @@ const clientSockets = new Map();
       localSocket.on('close', () => {
         console.log(`Local client ${conn_id} disconnected.`);
         if (clientSockets.has(conn_id)) {
-            clientSockets.delete(conn_id);
-            executeCode(ws, `close_connection("${conn_id}")`);
+          clientSockets.delete(conn_id);
+          executeCode(ws, `close_connection("${conn_id}")`);
         }
       });
       localSocket.on('error', (err) => {
         console.error(`Error on local socket ${conn_id}:`, err);
         if (clientSockets.has(conn_id)) {
-            clientSockets.delete(conn_id);
-            executeCode(ws, `close_connection("${conn_id}")`);
+          clientSockets.delete(conn_id);
+          executeCode(ws, `close_connection("${conn_id}")`);
         }
       });
     });
